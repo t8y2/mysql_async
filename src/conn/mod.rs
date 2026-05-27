@@ -510,11 +510,10 @@ impl Conn {
         self.inner.id = handshake.connection_id();
         self.inner.status = handshake.status_flags();
 
-        // Allow only CachingSha2Password and MysqlNativePassword here
-        // because sha256_password is deprecated and other plugins won't
-        // appear here.
+        // Allow only plugins with built-in client support here.
         self.inner.auth_plugin = match handshake.auth_plugin() {
             Some(AuthPlugin::CachingSha2Password) => AuthPlugin::CachingSha2Password,
+            Some(AuthPlugin::Sha256Password) => AuthPlugin::Sha256Password,
             _ => AuthPlugin::MysqlNativePassword,
         };
 
@@ -566,13 +565,24 @@ impl Conn {
     }
 
     async fn do_handshake_response(&mut self) -> Result<()> {
-        let auth_data = self
-            .inner
-            .auth_plugin
-            .gen_data(self.inner.opts.pass(), &self.inner.nonce);
+        let sha256_auth_data;
+        let plugin_auth_data;
+        if matches!(self.inner.auth_plugin, AuthPlugin::Sha256Password) {
+            sha256_auth_data = Some(self.sha256_password_auth_data());
+            plugin_auth_data = None;
+        } else {
+            sha256_auth_data = None;
+            plugin_auth_data = self
+                .inner
+                .auth_plugin
+                .gen_data(self.inner.opts.pass(), &self.inner.nonce);
+        }
+        let auth_data = sha256_auth_data
+            .as_deref()
+            .or_else(|| plugin_auth_data.as_ref().map(|data| &**data));
 
         let handshake_response = HandshakeResponse::new(
-            auth_data.as_deref(),
+            auth_data,
             self.inner.version,
             self.inner.opts.user().map(|x| x.as_bytes()),
             self.inner.opts.db_name().map(|x| x.as_bytes()),
@@ -612,33 +622,41 @@ impl Conn {
 
             self.inner.auth_plugin = auth_switch_request.auth_plugin().clone().into_owned();
 
-            let plugin_data = match &self.inner.auth_plugin {
-                x @ AuthPlugin::CachingSha2Password => {
-                    x.gen_data(self.inner.opts.pass(), &self.inner.nonce)
-                }
-                x @ AuthPlugin::MysqlNativePassword => {
-                    x.gen_data(self.inner.opts.pass(), &self.inner.nonce)
-                }
+            let plugin_data: Option<Cow<'_, [u8]>> = match &self.inner.auth_plugin {
+                AuthPlugin::Sha256Password => Some(Cow::Owned(self.sha256_password_auth_data())),
+                x @ AuthPlugin::CachingSha2Password => x
+                    .gen_data(self.inner.opts.pass(), &self.inner.nonce)
+                    .map(|data| Cow::Owned(data.into_owned().to_vec())),
+                x @ AuthPlugin::MysqlNativePassword => x
+                    .gen_data(self.inner.opts.pass(), &self.inner.nonce)
+                    .map(|data| Cow::Owned(data.into_owned().to_vec())),
                 x @ AuthPlugin::MysqlOldPassword => {
                     if self.inner.opts.secure_auth() {
                         return Err(DriverError::MysqlOldPasswordDisabled.into());
                     } else {
                         x.gen_data(self.inner.opts.pass(), &self.inner.nonce)
+                            .map(|data| Cow::Owned(data.into_owned().to_vec()))
                     }
                 }
                 x @ AuthPlugin::MysqlClearPassword => {
                     if self.inner.opts.enable_cleartext_plugin() {
                         x.gen_data(self.inner.opts.pass(), &self.inner.nonce)
+                            .map(|data| Cow::Owned(data.into_owned().to_vec()))
                     } else {
                         return Err(DriverError::CleartextPluginDisabled.into());
                     }
                 }
-                x @ AuthPlugin::Ed25519 => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
-                x @ AuthPlugin::Other(_) => x.gen_data(self.inner.opts.pass(), &self.inner.nonce),
+                x @ AuthPlugin::Ed25519 => x
+                    .gen_data(self.inner.opts.pass(), &self.inner.nonce)
+                    .map(|data| Cow::Owned(data.into_owned().to_vec())),
+                x @ AuthPlugin::Other(_) => x
+                    .gen_data(self.inner.opts.pass(), &self.inner.nonce)
+                    .map(|data| Cow::Owned(data.into_owned().to_vec())),
             };
 
             if let Some(plugin_data) = plugin_data {
-                self.write_struct(&plugin_data.into_owned()).await?;
+                self.write_packet(crate::buffer_pool().get_with(plugin_data.as_ref()))
+                    .await?;
             } else {
                 self.write_packet(crate::buffer_pool().get()).await?;
             }
@@ -662,6 +680,10 @@ impl Conn {
                 }
                 AuthPlugin::CachingSha2Password => {
                     self.continue_caching_sha2_password_auth().await?;
+                    Ok(())
+                }
+                AuthPlugin::Sha256Password => {
+                    self.continue_sha256_password_auth().await?;
                     Ok(())
                 }
                 AuthPlugin::MysqlClearPassword => {
@@ -698,11 +720,58 @@ impl Conn {
         Ok(())
     }
 
+    fn sha256_password_auth_data(&self) -> Vec<u8> {
+        let Some(pass) = self.inner.opts.pass().filter(|pass| !pass.is_empty()) else {
+            return Vec::new();
+        };
+
+        let mut pass = pass.as_bytes().to_vec();
+        pass.push(0);
+
+        if self.is_secure() || self.is_socket() {
+            return pass;
+        }
+
+        if let Some(server_key) = self.inner.server_key.as_deref() {
+            for (i, byte) in pass.iter_mut().enumerate() {
+                *byte ^= self.inner.nonce[i % self.inner.nonce.len()];
+            }
+            return crypto::encrypt(&pass, server_key);
+        }
+
+        vec![0x01]
+    }
+
     async fn continue_ed25519_auth(&mut self) -> Result<()> {
         let packet = self.read_packet().await?;
         match packet.first() {
             Some(0x00) => {
                 // ok packet for empty password
+                Ok(())
+            }
+            Some(0xfe) if !self.inner.auth_switched => {
+                let auth_switch_request = ParseBuf(&packet).parse::<AuthSwitchRequest>(())?;
+                self.perform_auth_switch(auth_switch_request).await
+            }
+            _ => Err(DriverError::UnexpectedPacket {
+                payload: packet.to_vec(),
+            }
+            .into()),
+        }
+    }
+
+    async fn continue_sha256_password_auth(&mut self) -> Result<()> {
+        let packet = self.read_packet().await?;
+        match packet.first() {
+            Some(0x00) => {
+                // auth ok
+                Ok(())
+            }
+            Some(0x01) if packet.len() > 1 => {
+                self.inner.server_key = Some(packet[1..].to_vec());
+                let auth_data = self.sha256_password_auth_data();
+                self.write_bytes(&auth_data).await?;
+                self.drop_packet().await?;
                 Ok(())
             }
             Some(0xfe) if !self.inner.auth_switched => {
@@ -1317,6 +1386,42 @@ mod test {
         from_row, params, prelude::*, test_misc::get_opts, ChangeUserOpts, Conn, Error,
         OptsBuilder, Pool, ServerError, Value, WhiteListFsHandler,
     };
+
+    const TEST_RSA_PUBLIC_KEY: &[u8] = br"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxSKOcxiet8lLMn8ImyUE
+bGGKob5EdRz/4wdiw12ED0GfKKTKhVnodFCfm1mdy7bKOX5QxL9skrvYodpW43eR
+R5bfOzIgy1qIB8RYb6qOXRBw1oA4snBDqtUjDv/lbHLJN+IbzM4oU+e3Lt9rXyLX
+VY289ewONPweXHqSCnTL91w+wkU1peIFV2QhZ+upUCdCtwOn5hnJPNgxtbklFoya
+C8W3Z7Xx7He2QDJsEWAqX197efw0L6j8X8Tyd8Uwb7zUB1tfMGhHfm9EwejPAtzx
+4GztQNtNMtGS2oGZLQBLV9hib4dDL92iiZeckg2LAf4GsJofLLR8mcHCRoqVbQJ1
+YQIDAQAB
+-----END PUBLIC KEY-----";
+
+    #[test]
+    fn sha256_password_requests_server_key_without_tls() {
+        let opts = OptsBuilder::default().pass(Some("secret"));
+        let mut conn = Conn {
+            inner: Box::new(super::ConnInner::empty(opts.into())),
+        };
+        conn.inner.nonce = b"01234567890123456789".to_vec();
+
+        assert_eq!(conn.sha256_password_auth_data(), vec![0x01]);
+    }
+
+    #[test]
+    fn sha256_password_encrypts_password_with_server_key_without_tls() {
+        let opts = OptsBuilder::default().pass(Some("secret"));
+        let mut conn = Conn {
+            inner: Box::new(super::ConnInner::empty(opts.into())),
+        };
+        conn.inner.nonce = b"01234567890123456789".to_vec();
+        conn.inner.server_key = Some(TEST_RSA_PUBLIC_KEY.to_vec());
+
+        let auth_data = conn.sha256_password_auth_data();
+
+        assert_eq!(auth_data.len(), 256);
+        assert_ne!(auth_data, b"secret\0");
+    }
 
     #[tokio::test]
     async fn should_return_found_rows_if_flag_is_set() -> super::Result<()> {
