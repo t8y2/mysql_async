@@ -1386,9 +1386,12 @@ mod test {
 
     #[tokio::test]
     async fn accepts_immediate_ok_after_caching_sha2_handshake_response() {
-        auth_with_server_packet(&[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])
-            .await
-            .unwrap();
+        for packet in [
+            &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00][..],
+            &[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00][..],
+        ] {
+            auth_with_server_packet(packet).await.unwrap();
+        }
     }
 
     #[tokio::test]
