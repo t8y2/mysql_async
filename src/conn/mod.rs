@@ -744,7 +744,10 @@ impl Conn {
             if packet.first() == Some(&0x00) {
                 let mut data = ParseBuf(&packet);
                 let _: OkPacketDeserializer<CommonOkPacket> = data.parse(self.capabilities())?;
-                if !data.is_empty() {
+                // Doris appends a zero byte to the authentication OK packet
+                // when CLIENT_DEPRECATE_EOF is disabled. Treat it as empty
+                // info padding while keeping non-zero trailing data invalid.
+                if !data.is_empty() && data.0.iter().any(|byte| *byte != 0) {
                     return Err(DriverError::UnexpectedPacket {
                         payload: packet.to_vec(),
                     }
@@ -1387,6 +1390,13 @@ mod test {
     #[tokio::test]
     async fn accepts_immediate_ok_after_caching_sha2_handshake_response() {
         auth_with_server_packet(&[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_doris_immediate_ok_with_empty_info_padding() {
+        auth_with_server_packet(&[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00])
             .await
             .unwrap();
     }
