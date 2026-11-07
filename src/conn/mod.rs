@@ -741,18 +741,14 @@ impl Conn {
             // A server or proxy may finish authentication directly after the
             // handshake response. Do not feed its OK packet to the plugin as
             // an AuthMoreData challenge.
+            //
+            // Bytes after the fixed OK fields belong to the free-form `info` /
+            // session-state payload, which servers and proxies (Doris, Percona
+            // behind cloud proxies, ...) encode inconsistently. Like the regular
+            // OK path in `handle_packet`, ignore whatever follows a well-formed OK.
             if packet.first() == Some(&0x00) {
-                let mut data = ParseBuf(&packet);
-                let _: OkPacketDeserializer<CommonOkPacket> = data.parse(self.capabilities())?;
-                // Doris appends a zero byte to the authentication OK packet
-                // when CLIENT_DEPRECATE_EOF is disabled. Treat it as empty
-                // info padding while keeping non-zero trailing data invalid.
-                if !data.is_empty() && data.0.iter().any(|byte| *byte != 0) {
-                    return Err(DriverError::UnexpectedPacket {
-                        payload: packet.to_vec(),
-                    }
-                    .into());
-                }
+                let _: OkPacketDeserializer<CommonOkPacket> =
+                    ParseBuf(&packet).parse(self.capabilities())?;
                 return Ok(());
             }
 
@@ -1395,20 +1391,22 @@ mod test {
     }
 
     #[tokio::test]
-    async fn accepts_doris_immediate_ok_with_empty_info_padding() {
-        auth_with_server_packet(&[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00])
-            .await
-            .unwrap();
+    async fn accepts_immediate_ok_with_trailing_info_bytes() {
+        // Doris-style zero padding, non-zero padding and a textual `info`.
+        for tail in [
+            &[0x00][..],
+            &[0x00, 0xff][..],
+            &[0x05, b'h', b'e', b'l', b'l', b'o'][..],
+        ] {
+            let mut packet = vec![0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
+            packet.extend_from_slice(tail);
+            auth_with_server_packet(&packet).await.unwrap();
+        }
     }
 
     #[tokio::test]
     async fn rejects_truncated_immediate_ok_and_invalid_auth_more_data() {
         assert!(auth_with_server_packet(&[0x00, 0x00]).await.is_err());
-        assert!(
-            auth_with_server_packet(&[0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xff])
-                .await
-                .is_err()
-        );
         assert!(auth_with_server_packet(&[0x01, 0x05]).await.is_err());
     }
 
